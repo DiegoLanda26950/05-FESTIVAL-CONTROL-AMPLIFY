@@ -6,6 +6,7 @@ web-build/
 .env.*
 !.env.example
 .DS_Store
+.npm/
 
 # Amplify Gen 2 outputs
 .amplify/
