@@ -6,3 +6,8 @@ web-build/
 .env.*
 !.env.example
 .DS_Store
+
+# Amplify Gen 2 outputs
+.amplify/
+amplify_outputs.json
+amplifyconfiguration*.json

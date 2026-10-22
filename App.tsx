@@ -1,7 +1,23 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
 import { initialEvents, FestivalEvent, EventStatus } from './src/data';
 import { theme as c } from './src/theme';
+import { Amplify } from 'aws-amplify';
+import { generateClient } from 'aws-amplify/data';
+import type { Schema } from './amplify/data/resource';
+
+// Inicialización de cliente Amplify si amplify_outputs.json existe (generado en deploy/sandbox)
+let client: ReturnType<typeof generateClient<Schema>> | null = null;
+let isCloudConfigured = false;
+try {
+  // @ts-ignore - amplify_outputs.json se genera automáticamente en ampx pipeline-deploy / ampx sandbox
+  const outputs = require('./amplify_outputs.json');
+  Amplify.configure(outputs);
+  client = generateClient<Schema>();
+  isCloudConfigured = true;
+} catch {
+  isCloudConfigured = false;
+}
 
 type Page = 'dashboard' | 'events' | 'form';
 const stages = ['MAIN STAGE', 'GARDEN', 'WAREHOUSE', 'RIVER STAGE'];
@@ -33,6 +49,7 @@ export default function App() {
   const wide = width > 860;
   const [page,setPage] = useState<Page>('dashboard');
   const [events,setEvents] = useState<FestivalEvent[]>(initialEvents);
+  const [connected, setConnected] = useState(isCloudConfigured);
   const [search,setSearch] = useState('');
   const [filter,setFilter] = useState('TODOS');
   const [editing,setEditing] = useState<string | null>(null);
@@ -42,24 +59,132 @@ export default function App() {
   const [status,setStatus] = useState<EventStatus>('CONFIRMED');
   const [notice,setNotice] = useState('');
 
+  // Suscripción en tiempo real a DynamoDB mediante AWS AppSync
+  useEffect(() => {
+    if (!client) return;
+
+    try {
+      const sub = client.models.FestivalEvent.observeQuery().subscribe({
+        next: ({ items }) => {
+          if (items && items.length > 0) {
+            setEvents(
+              items.map((item) => ({
+                id: item.id,
+                artist: item.artist,
+                space: item.space,
+                time: item.time,
+                status: (item.status as EventStatus) || 'CONFIRMED',
+              }))
+            );
+          }
+          setConnected(true);
+        },
+        error: (err) => {
+          console.warn('Error conectando con DynamoDB:', err);
+          setConnected(false);
+        },
+      });
+
+      return () => sub.unsubscribe();
+    } catch (err) {
+      console.warn('Error en suscripción:', err);
+    }
+  }, []);
+
   const filtered = useMemo(() => events.filter(e => (filter === 'TODOS' || e.space === filter) && (e.artist.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()))),[events,search,filter]);
   const openNew = () => {setEditing(null);setArtist('');setSpace(stages[0]);setTime('21:45');setStatus('CONFIRMED');setNotice('');setPage('form');};
   const openEdit = (e: FestivalEvent) => {setEditing(e.id);setArtist(e.artist);setSpace(e.space);setTime(e.time);setStatus(e.status);setNotice('');setPage('form');};
-  const save = () => {
-    if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){setNotice('Introduce un artista y una hora válida (HH:MM).');return;}
-    if(editing){setEvents(v => v.map(e => e.id === editing ? {...e,artist:artist.trim().toUpperCase(),space,time,status} : e));setNotice('Evento actualizado (datos locales).');}
-    else {const id='EVT-'+Date.now().toString().slice(-7);setEvents(v=>[{id,artist:artist.trim().toUpperCase(),space,time,status},...v]);setNotice('Evento creado (datos locales).');}
+
+  const save = async () => {
+    if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){
+      setNotice('Introduce un artista y una hora válida (HH:MM).');
+      return;
+    }
+    const cleanArtist = artist.trim().toUpperCase();
+
+    if (client && connected) {
+      try {
+        if (editing) {
+          await client.models.FestivalEvent.update({
+            id: editing,
+            artist: cleanArtist,
+            space,
+            time,
+            status,
+          });
+          setNotice('Evento actualizado en DynamoDB.');
+        } else {
+          await client.models.FestivalEvent.create({
+            artist: cleanArtist,
+            space,
+            time,
+            status,
+          });
+          setNotice('Evento guardado en DynamoDB.');
+        }
+      } catch (err) {
+        console.error('Error guardando en DynamoDB:', err);
+        setNotice('Error en DynamoDB. Guardado en memoria.');
+        if (editing) {
+          setEvents(v => v.map(e => e.id === editing ? {...e,artist:cleanArtist,space,time,status} : e));
+        } else {
+          const id = 'EVT-' + Date.now().toString().slice(-7);
+          setEvents(v => [{ id, artist: cleanArtist, space, time, status }, ...v]);
+        }
+      }
+    } else {
+      if (editing) {
+        setEvents(v => v.map(e => e.id === editing ? {...e,artist:cleanArtist,space,time,status} : e));
+        setNotice('Evento actualizado (datos locales).');
+      } else {
+        const id = 'EVT-' + Date.now().toString().slice(-7);
+        setEvents(v => [{ id, artist: cleanArtist, space, time, status }, ...v]);
+        setNotice('Evento creado (datos locales).');
+      }
+    }
     setPage('events');
   };
-  const changeStatus = (id:string) => {setEvents(v=>v.map(e=>e.id===id?{...e,status:e.status==='CONFIRMED'?'DELAYED':e.status==='DELAYED'?'CANCELLED':'CONFIRMED'}:e));setNotice('Estado actualizado localmente.');};
-  const remove = (id:string) => {setEvents(v=>v.filter(e=>e.id!==id));setNotice('Evento eliminado localmente.');};
+
+  const changeStatus = async (id: string) => {
+    const cur = events.find(e => e.id === id);
+    const nextStatus: EventStatus = cur?.status === 'CONFIRMED' ? 'DELAYED' : cur?.status === 'DELAYED' ? 'CANCELLED' : 'CONFIRMED';
+
+    if (client && connected) {
+      try {
+        await client.models.FestivalEvent.update({ id, status: nextStatus });
+        setNotice('Estado actualizado en DynamoDB.');
+      } catch (err) {
+        setEvents(v => v.map(e => e.id === id ? { ...e, status: nextStatus } : e));
+        setNotice('Estado actualizado localmente.');
+      }
+    } else {
+      setEvents(v => v.map(e => e.id === id ? { ...e, status: nextStatus } : e));
+      setNotice('Estado actualizado localmente.');
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (client && connected) {
+      try {
+        await client.models.FestivalEvent.delete({ id });
+        setNotice('Evento eliminado de DynamoDB.');
+      } catch (err) {
+        setEvents(v => v.filter(e => e.id !== id));
+        setNotice('Evento eliminado localmente.');
+      }
+    } else {
+      setEvents(v => v.filter(e => e.id !== id));
+      setNotice('Evento eliminado localmente.');
+    }
+  };
+
   const confirmed = events.filter(e=>e.status==='CONFIRMED').length;
   const delayed = events.filter(e=>e.status==='DELAYED').length;
   return <SafeAreaView style={s.root}>
     <ScrollView contentContainerStyle={[s.container,wide&&{maxWidth:1160,alignSelf:'center',width:'100%'}]}>
       <View style={s.header}>
         <View><Text style={s.brand}>FESTIVAL CONTROL<Text style={{color:c.pink}}> /</Text></Text><Text style={s.kicker}>LIVE OPERATIONS · EXPO WEB</Text></View>
-        <Text style={s.live}>● LIVE DEMO</Text>
+        <Text style={[s.live, connected && {color: c.green}]}>● {connected ? 'DYNAMODB CONNECTED' : 'LOCAL DEMO'}</Text>
       </View>
       <View style={s.nav}>
         {([['dashboard','DASHBOARD'],['events','EVENTOS'],['form','+ NUEVO EVENTO']] as const).map(([key,label])=>
@@ -68,7 +193,7 @@ export default function App() {
       <View style={s.hero}>
         <Text style={s.heroTag}>ZARAGOZA · FESTIVAL OPERATIONS</Text>
         <Text style={[s.heroTitle,wide&&{fontSize:62}]}>THE NIGHT{ '\n' }IS YOURS.</Text>
-        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Demo interactiva sin backend.</Text>
+        <Text style={s.heroSub}>{connected ? 'Gestiona la programación en tiempo real con persistencia en Amazon DynamoDB.' : 'Gestiona la programación en tiempo real. Demo interactiva sin backend.'}</Text>
       </View>
       {page==='dashboard' && <>
         <Text style={s.section}>PANEL DE CONTROL</Text>
@@ -92,7 +217,7 @@ export default function App() {
       </>}
       {page==='form' && <>
         <Text style={s.section}>{editing?'EDITAR EVENTO':'NUEVO EVENTO'}</Text>
-        <Text style={s.subtitle}>Completa los datos. Esta demo guarda los cambios sólo en memoria.</Text>
+        <Text style={s.subtitle}>Completa los datos. {connected ? 'Los cambios se guardan directamente en DynamoDB.' : 'Esta demo guarda los cambios sólo en memoria.'}</Text>
         <View style={s.form}>
           <Text style={s.label}>ARTISTA *</Text>
           <TextInput accessibilityLabel="Artista" placeholder="Ej. TECHNO TITANS" placeholderTextColor="#777" style={s.input} value={artist} onChangeText={setArtist}/>
@@ -107,7 +232,10 @@ export default function App() {
         </View>
       </>}
       {!!notice && <Text accessibilityRole="alert" style={s.notice}>{notice}</Text>}
-      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · FRONTEND DEMO · REACT NATIVE + EXPO</Text><Text style={s.footerText}>NO BACKEND · NO HTTP · NO PERSISTENCIA</Text></View>
+      <View style={s.footer}>
+        <Text style={s.footerText}>FESTIVAL CONTROL · AWS AMPLIFY GEN 2 · REACT NATIVE + EXPO</Text>
+        <Text style={s.footerText}>{connected ? 'PERSISTENCIA CLOUD · AWS APPSYNC & AMAZON DYNAMODB' : 'MODO LOCAL · DESPLIEGA EL BACKEND PARA PERSISTENCIA CLOUD'}</Text>
+      </View>
     </ScrollView>
   </SafeAreaView>;
 }
@@ -115,7 +243,7 @@ const s=StyleSheet.create({
   root:{flex:1,backgroundColor:c.background},container:{padding:20,paddingBottom:60},
   header:{paddingTop:24,paddingBottom:22,flexDirection:'row',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:10},
   brand:{fontSize:20,fontWeight:'900',color:c.white,letterSpacing:1},kicker:{fontSize:10,color:c.muted,letterSpacing:2,marginTop:5},
-  live:{color:c.green,fontSize:11,fontWeight:'900'},nav:{flexDirection:'row',flexWrap:'wrap',gap:9,marginBottom:18},
+  live:{color:c.amber,fontSize:11,fontWeight:'900'},nav:{flexDirection:'row',flexWrap:'wrap',gap:9,marginBottom:18},
   navItem:{backgroundColor:'#191919',paddingHorizontal:15,paddingVertical:12,borderRadius:10,borderWidth:1,borderColor:c.border},
   navActive:{backgroundColor:c.pink,borderColor:c.pink},navText:{fontSize:11,fontWeight:'900',color:c.muted},
   hero:{backgroundColor:'#171018',borderColor:'#4C1934',borderWidth:1,borderRadius:22,padding:28,marginBottom:30},
